@@ -6,7 +6,7 @@ const cheerio = require("cheerio");
 const { MARKETS } = require("./markets");
 
 // ============================================
-// SOURCE CONFIGURATION
+// CONFIGURATION
 // ============================================
 
 const SOURCES = {
@@ -65,32 +65,43 @@ function getSourceMarketName(market, source) {
   }
 
   return (
-    market.aliases?.[source] ||
-    market.name ||
-    market.id
+    market?.aliases?.[source] ||
+    market?.name ||
+    market?.id ||
+    ""
   );
 }
 
+function getCheckingStage(market) {
+  if (typeof market === "string") {
+    return "open";
+  }
+
+  return market?.checking || market?.stage || "open";
+}
+
 // ============================================
-// PARSE RESULT TEXT
+// PARSE MARKET RESULT
 // ============================================
 
 function parseResultText(text) {
   const rawResult = normalizeRaw(text);
 
+  const emptyResult = {
+    rawResult: rawResult || null,
+    openPanel: null,
+    openJodi: null,
+    closePanel: null,
+    openComplete: false,
+    closeComplete: false,
+    status: "pending",
+  };
+
   if (!rawResult) {
-    return {
-      rawResult: null,
-      openPanel: null,
-      openJodi: null,
-      closePanel: null,
-      openComplete: false,
-      closeComplete: false,
-      status: "pending",
-    };
+    return emptyResult;
   }
 
-  // Supported examples:
+  // Examples:
   // 177-57-179
   // 177-5X-XXX
   // 177-57-XXX
@@ -103,12 +114,7 @@ function parseResultText(text) {
 
   if (!match) {
     return {
-      rawResult,
-      openPanel: null,
-      openJodi: null,
-      closePanel: null,
-      openComplete: false,
-      closeComplete: false,
+      ...emptyResult,
       status: /^(loading|please wait)\.{0,3}$/i.test(rawResult)
         ? "loading"
         : "unrecognized",
@@ -320,7 +326,6 @@ async function scrapeDPBoss(
     }
 
     const card = heading.parent();
-
     const cardText = normalizeRaw(card.text());
 
     const remainingText = cardText
@@ -343,7 +348,9 @@ async function scrapeDPBoss(
         canonicalMarket,
         source,
         rawResult: remainingText || null,
-        status: remainingText ? "unrecognized" : "pending",
+        status: remainingText
+          ? "unrecognized"
+          : "pending",
       });
     }
 
@@ -367,15 +374,11 @@ async function scrapeDPBoss(
 }
 
 // ============================================
-// EVALUATE RESULT FOR CONFIGURED STAGE
+// EVALUATE RESULT FOR A STAGE
 // ============================================
 
 function evaluateResult(result, market) {
-  const checking =
-    typeof market === "string"
-      ? "open"
-      : market.checking || "open";
-
+  const checking = getCheckingStage(market);
   const validMode = ["open", "close"].includes(checking);
 
   const targetResultAvailable =
@@ -393,13 +396,17 @@ function evaluateResult(result, market) {
   } else if (result.status === "error") {
     todayCheck = "source_error";
   } else if (
-    ["not_found", "unrecognized", "loading"].includes(result.status)
+    ["not_found", "unrecognized", "loading"].includes(
+      result.status
+    )
   ) {
     todayCheck = result.status;
   } else if (checking === "open") {
     if (!result.openComplete) {
       todayCheck = "open_result_pending";
     } else if (result.closeComplete) {
+      // A complete close value may be an older result.
+      // Do not automatically approve it as today's open.
       todayCheck = "close_already_present_not_first_open";
     } else {
       isTodayResult = true;
@@ -428,7 +435,7 @@ function evaluateResult(result, market) {
 }
 
 // ============================================
-// NORMALIZE RESULT FOR COMPARISON
+// GET NORMALIZED STAGE VALUE
 // ============================================
 
 function getStageValue(result, stage) {
@@ -446,7 +453,9 @@ function getStageValue(result, stage) {
       return null;
     }
 
-    return `${result.openPanel}-${String(result.openJodi).padStart(2, "0")}`;
+    return `${result.openPanel}-${String(
+      result.openJodi
+    ).padStart(2, "0")}`;
   }
 
   if (stage === "close") {
@@ -464,7 +473,7 @@ function getStageValue(result, stage) {
 }
 
 // ============================================
-// CONFIRM ONLY THE CONFIGURED STAGE
+// CONFIRM RESULT FROM AT LEAST TWO SOURCES
 // ============================================
 
 function confirmResultUpload({
@@ -492,6 +501,7 @@ function confirmResultUpload({
     report.reasons.push(
       'Invalid checking value. Use "open" or "close".'
     );
+
     return report;
   }
 
@@ -512,6 +522,7 @@ function confirmResultUpload({
         source: sourceId,
         reason: "Source result missing.",
       });
+
       continue;
     }
 
@@ -520,14 +531,16 @@ function confirmResultUpload({
         source: sourceId,
         reason: result.error || "Source request failed.",
       });
+
       continue;
     }
 
     if (result.isTodayResult !== true) {
       report.rejectedSources.push({
         source: sourceId,
-        reason: "isTodayResult is false.",
+        reason: result.todayCheck || "Result not verified.",
       });
+
       continue;
     }
 
@@ -536,8 +549,10 @@ function confirmResultUpload({
     if (!value) {
       report.rejectedSources.push({
         source: sourceId,
-        reason: `No complete ${stage} result marked as today's result.`,
+        reason:
+          `No complete ${stage} result marked as today's result.`,
       });
+
       continue;
     }
 
@@ -562,10 +577,14 @@ function confirmResultUpload({
   report.matchingSources = bestSources;
   report.matchingCount = bestSources.length;
 
-  if (!bestValue || bestSources.length < REQUIRED_AGREEMENTS) {
+  if (
+    !bestValue ||
+    bestSources.length < REQUIRED_AGREEMENTS
+  ) {
     report.reasons.push(
-      `At least ${REQUIRED_AGREEMENTS} websites must have isTodayResult=true and agree on the same complete ${stage} result.`
+      `At least ${REQUIRED_AGREEMENTS} websites must agree on the same complete ${stage} result.`
     );
+
     return report;
   }
 
@@ -573,7 +592,7 @@ function confirmResultUpload({
   report.status = "OK_TO_UPLOAD";
 
   report.reasons.push(
-    `${bestSources.length} websites agree on ${bestValue}, and each matching source has isTodayResult=true.`
+    `${bestSources.length} websites agree on ${bestValue}.`
   );
 
   const otherSources = SOURCE_IDS.filter(
@@ -582,7 +601,8 @@ function confirmResultUpload({
 
   if (otherSources.length > 0) {
     report.warning =
-      `Disagreement or unavailable result from: ${otherSources.join(", ")}`;
+      "Disagreement or unavailable result from: " +
+      otherSources.join(", ");
 
     report.reasons.push(report.warning);
   }
@@ -591,24 +611,31 @@ function confirmResultUpload({
 }
 
 // ============================================
-// SCRAPE ONE MARKET
+// SCRAPE ONE MARKET FROM ALL THREE SOURCES
 // ============================================
 
 async function scrapeMarketFromAllSources(market) {
   const canonicalMarket =
     typeof market === "string"
       ? market
-      : market.name;
+      : market?.name;
 
   const marketId =
     typeof market === "string"
       ? null
-      : market.id;
+      : market?.id || null;
 
-  const checking =
-    typeof market === "string"
-      ? "open"
-      : market.checking || "open";
+  const checking = getCheckingStage(market);
+
+  if (!canonicalMarket) {
+    throw new Error("Market is missing its name.");
+  }
+
+  if (!["open", "close"].includes(checking)) {
+    throw new Error(
+      `Invalid stage "${checking}" for ${canonicalMarket}.`
+    );
+  }
 
   const [dpboss, madhurbazar, mydpboss] =
     await Promise.all([
@@ -628,19 +655,16 @@ async function scrapeMarketFromAllSources(market) {
       ),
     ]);
 
-  const rawSources = [dpboss, madhurbazar, mydpboss];
+  const rawSources = [
+    dpboss,
+    madhurbazar,
+    mydpboss,
+  ];
 
-  // Evaluate using this market's configured checking value.
+  // Evaluate each source for the requested stage.
   const sources = rawSources.map((result) =>
-    evaluateResult(result, {
-      checking,
-    })
+    evaluateResult(result, { checking })
   );
-
-  // IMPORTANT:
-  // Only confirm the stage configured in markets.js.
-  // checking: "open"  -> open confirmation only.
-  // checking: "close" -> close confirmation only.
 
   const confirmation = confirmResultUpload({
     marketId,
@@ -660,38 +684,71 @@ async function scrapeMarketFromAllSources(market) {
 }
 
 // ============================================
-// SCRAPE ALL CONFIGURED MARKETS
+// SCRAPE ALL ENABLED MARKETS
 // ============================================
 
-async function scrapeAllMarkets() {
-  const markets = Array.isArray(MARKETS) ? MARKETS : [];
+async function scrapeAllMarkets(options = {}) {
+  const requestedStage = options.stage || options.checking;
+
+  const markets = (
+    Array.isArray(MARKETS) ? MARKETS : []
+  ).filter((market) => {
+    return (
+      typeof market === "string" ||
+      (market && market.enabled !== false)
+    );
+  });
 
   const results = await Promise.all(
     markets.map(async (market) => {
-      if (typeof market === "string") {
-        return scrapeMarketFromAllSources(market);
-      }
-
-      if (!market || !market.name) {
+      if (!market || (typeof market !== "string" && !market.name)) {
         return {
           market: market || null,
           error: "Market is missing its name.",
         };
       }
 
-      return scrapeMarketFromAllSources(market);
+      const selectedMarket =
+        typeof market === "string"
+          ? {
+              name: market,
+              checking: requestedStage || "open",
+            }
+          : {
+              ...market,
+              checking:
+                requestedStage ||
+                market.checking ||
+                market.stage ||
+                "open",
+            };
+
+      try {
+        return await scrapeMarketFromAllSources(
+          selectedMarket
+        );
+      } catch (error) {
+        return {
+          market:
+            typeof market === "string"
+              ? market
+              : market.name,
+          error: error.message,
+        };
+      }
     })
   );
 
   return {
     checkedAt: new Date().toISOString(),
+    stage: requestedStage || "configured",
     marketCount: results.length,
     results,
   };
 }
 
 // ============================================
-// RUN FROM TERMINAL
+// TERMINAL REPORT
 // ============================================
 
 async function main() {
@@ -701,22 +758,25 @@ async function main() {
 
   console.log(JSON.stringify(report, null, 2));
 
-  console.log("\n========== UPLOAD DECISIONS ==========\n");
+  console.log("\n========== CONFIRMATION SUMMARY ==========\n");
 
   let approvedCount = 0;
 
   for (const market of report.results) {
     if (!market.confirmation) {
       console.log(
-        `ERROR | ${market.market || "Unknown market"} | ${market.error || "Confirmation unavailable"}`
+        `ERROR | ${market.market || "Unknown market"} | ` +
+        `${market.error || "Confirmation unavailable"}`
       );
+
       continue;
     }
 
     const decision = market.confirmation;
 
     console.log(
-      `${decision.status} | ${market.market} | ${decision.stage.toUpperCase()} | ` +
+      `${decision.status} | ${market.market} | ` +
+      `${decision.stage.toUpperCase()} | ` +
       `${decision.candidateResult || "NO CONFIRMED RESULT"} | ` +
       `${decision.matchingCount}/${decision.requiredAgreements} matching websites`
     );
@@ -733,10 +793,16 @@ async function main() {
       console.log(`- ${reason}`);
     }
 
+    for (const rejected of decision.rejectedSources || []) {
+      console.log(
+        `REJECTED | ${rejected.source} | ${rejected.reason}`
+      );
+    }
+
     console.log("");
   }
 
-  console.log(`Approved configured stages: ${approvedCount}`);
+  console.log(`Approved stages: ${approvedCount}`);
   console.log("No Firebase upload is performed by this script.");
 }
 
@@ -746,6 +812,8 @@ async function main() {
 
 module.exports = {
   SOURCES,
+  SOURCE_IDS,
+  REQUIRED_AGREEMENTS,
   parseResultText,
   makeResult,
   evaluateResult,

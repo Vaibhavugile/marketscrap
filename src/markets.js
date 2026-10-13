@@ -1,3 +1,4 @@
+
 const MARKETS = [
   {
     id: "time_bazar",
@@ -12,7 +13,7 @@ const MARKETS = [
     openTime: "13:00",
     closeTime: "14:00",
 
-    checking: "open",
+    enabled: true,
   },
 
   {
@@ -25,13 +26,11 @@ const MARKETS = [
       mydpboss: "MILAN DAY",
     },
 
-    openTime: "15:00",
-    closeTime: "17:00",
+    openTime: "15:25",
+    closeTime: "17:25",
 
-    checking: "open",
+    enabled: true,
   },
-
-  // Keep your other existing markets here.
 ];
 
 module.exports = { MARKETS };
