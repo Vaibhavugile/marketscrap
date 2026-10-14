@@ -64,6 +64,26 @@ function getLocalDateAndTime() {
   };
 }
 
+/* =========================================================
+   MIDNIGHT SESSION HELPERS
+========================================================= */
+
+function crossesMidnight(market) {
+  // Example: open 22:00, close 00:02.
+  // The close belongs to the previous session date.
+  return String(market.closeTime) < String(market.openTime);
+}
+
+function getPreviousDateKey(dateKey) {
+  // UTC is used only for date arithmetic.
+  // The actual market timezone remains Asia/Kolkata.
+  const date = new Date(`${dateKey}T00:00:00Z`);
+
+  date.setUTCDate(date.getUTCDate() - 1);
+
+  return date.toISOString().slice(0, 10);
+}
+
 function getConfiguredMarketList() {
   return MARKETS.filter(
     (market) => market && market.enabled !== false
@@ -411,38 +431,36 @@ async function trySyncApprovedStage(
       status: "synced",
     };
   } catch (error) {
-  logger.error("Receiving-project sync failed", {
-    market: market.name,
-    marketId: market.id,
-    stage,
-    dateKey,
-    errorMessage: error.message,
-    errorCode: error.code || null,
-    errorDetails: error.details || null,
-    errorStack: error.stack || null,
-  });
+    logger.error("Receiving-project sync failed", {
+      market: market.name,
+      marketId: market.id,
+      stage,
+      dateKey,
+      errorMessage: error.message,
+      errorCode: error.code || null,
+      errorDetails: error.details || null,
+      errorStack: error.stack || null,
+    });
 
-  await stateRef.set(
-    {
-      receivingSyncStatus: "pending",
-      receivingSyncError: error.message,
-      receivingSyncAttemptAt:
-        admin.firestore.FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
+    await stateRef.set(
+      {
+        receivingSyncStatus: "pending",
+        receivingSyncError: error.message,
+        receivingSyncAttemptAt:
+          admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
 
-  return {
-    status: "sync_pending",
-    message: error.message,
-  };
-}
-
-    
+    return {
+      status: "sync_pending",
+      message: error.message,
+    };
+  }
 }
 
 /* =========================================================
-   EXISTING SCRAPER — APPROVAL LOGIC PRESERVED
+   SCRAPER — APPROVAL LOGIC PRESERVED
 ========================================================= */
 
 async function processMarketStage(
@@ -493,12 +511,25 @@ async function processMarketStage(
       };
     }
 
-    const scheduledTime =
-      stage === "open"
-        ? market.openTime
-        : market.closeTime;
+    // Determine whether this stage is due.
+    const isCrossMidnight = crossesMidnight(market);
+    let isDue;
 
-    if (currentTime < scheduledTime) {
+    if (stage === "open") {
+      // Open stage belongs to the current session date.
+      isDue = currentTime >= market.openTime;
+    } else if (isCrossMidnight) {
+      // For markets such as 22:00 -> 00:02, the close is due
+      // after midnight and belongs to the previous session date.
+      isDue =
+        currentTime >= market.closeTime &&
+        currentTime < market.openTime;
+    } else {
+      // Normal same-day close.
+      isDue = currentTime >= market.closeTime;
+    }
+
+    if (!isDue) {
       return {
         market: market.name,
         stage,
@@ -661,7 +692,7 @@ async function processMarketStage(
       { merge: true }
     );
 
-    // Commit source-project approval before attempting the receiving sync.
+    // Commit source-project approval before receiving-project sync.
     await batch.commit();
 
     logger.info("Market result approved and saved", {
@@ -727,6 +758,7 @@ async function processMarketStage(
     };
   }
 }
+
 /* =========================================================
    SCHEDULED MARKET SCRAPER
 ========================================================= */
@@ -746,13 +778,45 @@ exports.scheduledMarketScraper = onSchedule(
     const tasks = [];
 
     for (const market of markets) {
+      // Open always belongs to today's session date.
       tasks.push(
-        processMarketStage(market, "open", dateKey, time)
+        processMarketStage(
+          market,
+          "open",
+          dateKey,
+          time
+        )
       );
 
+      // A midnight close belongs to yesterday's session
+      // until the next opening time is reached.
+      const closeDateKey =
+        crossesMidnight(market) && time < market.openTime
+          ? getPreviousDateKey(dateKey)
+          : dateKey;
+
       tasks.push(
-        processMarketStage(market, "close", dateKey, time)
+        processMarketStage(
+          market,
+          "close",
+          closeDateKey,
+          time
+        )
       );
+
+      // After today's open time, also revisit yesterday's
+      // close state so an already-approved but unsynced close
+      // can retry synchronization.
+      if (crossesMidnight(market) && time >= market.openTime) {
+        tasks.push(
+          processMarketStage(
+            market,
+            "close",
+            getPreviousDateKey(dateKey),
+            time
+          )
+        );
+      }
     }
 
     const results = await Promise.all(tasks);
@@ -1003,7 +1067,7 @@ exports.publicMarketApi = onRequest(
           }
         }
 
-        // Fallback to the current result only if its date matches.
+        // Fallback to current result only if its date matches.
         const savedDate = current[`${stage}DateKey`];
         const value = current[`${stage}Result`];
 
