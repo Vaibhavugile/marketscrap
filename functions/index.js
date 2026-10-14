@@ -1,4 +1,3 @@
-
 "use strict";
 
 const { setGlobalOptions } = require("firebase-functions/v2");
@@ -16,8 +15,25 @@ if (admin.apps.length === 0) {
 
 const db = admin.firestore();
 
+// Receiving Firebase project.
+// The source function's runtime service account must have
+// roles/datastore.user on project matkanews-79fb7.
+const RECEIVING_PROJECT_ID = "matkanews-79fb7";
+
+const receivingApp =
+  admin.apps.find((app) => app.name === "receiving-project") ||
+  admin.initializeApp(
+    {
+      credential: admin.credential.applicationDefault(),
+      projectId: RECEIVING_PROJECT_ID,
+    },
+    "receiving-project"
+  );
+
+const receivingDb = receivingApp.firestore();
+
 const TIME_ZONE = "Asia/Kolkata";
-const MAX_ATTEMPTS = 10;
+const MAX_ATTEMPTS = 11;
 
 setGlobalOptions({
   maxInstances: 1,
@@ -55,22 +71,417 @@ function getConfiguredMarketList() {
 }
 
 /* =========================================================
+   RECEIVING PROJECT SYNC
+========================================================= */
+
+function calculateAnk(panna) {
+  const value = String(panna || "");
+
+  if (!/^\d{3}$/.test(value)) {
+    return "";
+  }
+
+  return String(
+    value
+      .split("")
+      .reduce((sum, digit) => sum + Number(digit), 0) % 10
+  );
+}
+
+function isValidPanna(value) {
+  return /^\d{3}$/.test(String(value ?? ""));
+}
+
+function calculateJodi(openAnk, closeAnk) {
+  if (
+    !/^\d$/.test(String(openAnk ?? "")) ||
+    !/^\d$/.test(String(closeAnk ?? ""))
+  ) {
+    return "";
+  }
+
+  return `${openAnk}${closeAnk}`;
+}
+
+async function findReceivingMarket(scraperMarketId) {
+  const snapshot = await receivingDb
+    .collection("markets")
+    .where("scraperMarketId", "==", scraperMarketId)
+    .limit(2)
+    .get();
+
+  if (snapshot.empty) {
+    throw new Error(
+      `No receiving market has scraperMarketId=${scraperMarketId}`
+    );
+  }
+
+  if (snapshot.size > 1) {
+    throw new Error(
+      `Duplicate scraperMarketId=${scraperMarketId} in receiving markets`
+    );
+  }
+
+  const doc = snapshot.docs[0];
+
+  return {
+    id: doc.id,
+    ...doc.data(),
+  };
+}
+
+async function updateReceivingPanelChart(
+  marketId,
+  dateKey,
+  values
+) {
+  const chartsRef = receivingDb
+    .collection("markets")
+    .doc(marketId)
+    .collection("panelCharts");
+
+  const snapshot = await chartsRef.get();
+
+  const chartDoc = snapshot.docs.find((doc) => {
+    const data = doc.data();
+
+    const startDate = String(data.startDate || "");
+    const endDate = String(data.endDate || "");
+
+    return (
+      startDate <= dateKey &&
+      endDate >= dateKey &&
+      Array.isArray(data.days)
+    );
+  });
+
+  if (!chartDoc) {
+    logger.warn(
+      "No matching panel chart week found; result document still synced",
+      {
+        marketId,
+        dateKey,
+      }
+    );
+
+    return;
+  }
+
+  const data = chartDoc.data();
+
+  const days = data.days.map((day) => {
+    if (day.date !== dateKey) {
+      return day;
+    }
+
+    const updated = { ...day };
+
+    if (values.openPanna !== undefined) {
+      updated.open = values.openPanna;
+    }
+
+    if (values.jodi !== undefined) {
+      updated.jodi = values.jodi;
+    }
+
+    if (values.closePanna !== undefined) {
+      updated.close = values.closePanna;
+    }
+
+    return updated;
+  });
+
+  await chartDoc.ref.update({
+    days,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+async function syncApprovedStageToReceiving(
+  market,
+  stage,
+  dateKey,
+  approvedPanna
+) {
+  if (stage !== "open" && stage !== "close") {
+    throw new Error(`Unsupported stage: ${stage}`);
+  }
+
+  if (!isValidPanna(approvedPanna)) {
+    throw new Error(
+      `Approved ${stage} result must contain exactly three digits`
+    );
+  }
+
+  const receivingMarket = await findReceivingMarket(market.id);
+
+  const marketId = receivingMarket.id;
+  const marketName = receivingMarket.name || market.name;
+
+  const resultRef = receivingDb
+    .collection("results")
+    .doc(`${marketId}_${dateKey}`);
+
+  const marketRef = receivingDb
+    .collection("markets")
+    .doc(marketId);
+
+  const existingResultSnap = await resultRef.get();
+
+  const existingResult = existingResultSnap.exists
+    ? existingResultSnap.data()
+    : {};
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  let resultPatch;
+  let panelValues;
+  let latestResult;
+
+  if (stage === "open") {
+    const openAnk = calculateAnk(approvedPanna);
+
+    resultPatch = {
+      marketId,
+      marketName,
+      resultDate: dateKey,
+      year: Number(dateKey.slice(0, 4)),
+      month: Number(dateKey.slice(5, 7)),
+      day: Number(dateKey.slice(8, 10)),
+      openPanna: approvedPanna,
+      openAnk,
+      closePanna: existingResult.closePanna || "",
+      closeAnk: existingResult.closeAnk || "",
+      jodi: existingResult.jodi || "",
+      ...(!existingResult.createdAt
+        ? { createdAt: now }
+        : {}),
+      updatedAt: now,
+    };
+
+    latestResult = {
+      openPanna: approvedPanna,
+      openAnk,
+      jodi: existingResult.jodi || "",
+      closePanna: existingResult.closePanna || "",
+      closeAnk: existingResult.closeAnk || "",
+      resultDate: dateKey,
+    };
+
+    panelValues = {
+      openPanna: approvedPanna,
+    };
+  } else {
+    // Close must use the already-saved open result.
+    // Never fabricate a jodi if the open result is missing.
+    const openPanna = String(
+      existingResult.openPanna || ""
+    );
+
+    const openAnk = String(
+      existingResult.openAnk || calculateAnk(openPanna)
+    );
+
+    if (
+      !isValidPanna(openPanna) ||
+      !/^\d$/.test(openAnk)
+    ) {
+      throw new Error(
+        `Cannot sync close result for ${market.id}: open result is not yet present in receiving project`
+      );
+    }
+
+    const closeAnk = calculateAnk(approvedPanna);
+    const jodi = calculateJodi(openAnk, closeAnk);
+
+    resultPatch = {
+      closePanna: approvedPanna,
+      closeAnk,
+      jodi,
+      updatedAt: now,
+    };
+
+    latestResult = {
+      openPanna,
+      openAnk,
+      jodi,
+      closePanna: approvedPanna,
+      closeAnk,
+      resultDate: dateKey,
+    };
+
+    panelValues = {
+      jodi,
+      closePanna: approvedPanna,
+    };
+  }
+
+  // Merge ensures that saving the close result preserves the open result.
+  await resultRef.set(resultPatch, { merge: true });
+
+  await marketRef.set(
+    {
+      latestResult,
+      updatedAt: now,
+    },
+    { merge: true }
+  );
+
+  // Keep the same announcement fields as ResultService.
+  await receivingDb
+    .collection("announcements")
+    .doc("latest")
+    .set(
+      {
+        marketId,
+        marketName,
+        openPanna: latestResult.openPanna || "",
+        jodi: latestResult.jodi || "",
+        closePanna: latestResult.closePanna || "",
+        resultDate: dateKey,
+        createdAt: now,
+      },
+      { merge: true }
+    );
+
+  // Keep the same breaking-news result format.
+  await receivingDb
+    .collection("breakingNews")
+    .doc("latest")
+    .set(
+      {
+        marketId,
+        resultDate: dateKey,
+        result: `${latestResult.openPanna || ""}-${latestResult.jodi || ""}-${latestResult.closePanna || ""}`,
+        updatedAt: now,
+      },
+      { merge: true }
+    );
+
+  await updateReceivingPanelChart(
+    marketId,
+    dateKey,
+    panelValues
+  );
+
+  logger.info("Approved result synced to receiving project", {
+    scraperMarketId: market.id,
+    receivingMarketId: marketId,
+    stage,
+    dateKey,
+    result: approvedPanna,
+  });
+}
+
+async function trySyncApprovedStage(
+  market,
+  stage,
+  dateKey,
+  stateRef,
+  state
+) {
+  if (state.receivingSyncStatus === "synced") {
+    return {
+      status: "already_approved_and_synced",
+    };
+  }
+
+  const approvedResult = state.approvedResult;
+
+  try {
+    await syncApprovedStageToReceiving(
+      market,
+      stage,
+      dateKey,
+      approvedResult
+    );
+
+    await stateRef.set(
+      {
+        receivingSyncStatus: "synced",
+        receivingSyncedAt:
+          admin.firestore.FieldValue.serverTimestamp(),
+        receivingSyncError:
+          admin.firestore.FieldValue.delete(),
+      },
+      { merge: true }
+    );
+
+    return {
+      status: "synced",
+    };
+  } catch (error) {
+  logger.error("Receiving-project sync failed", {
+    market: market.name,
+    marketId: market.id,
+    stage,
+    dateKey,
+    errorMessage: error.message,
+    errorCode: error.code || null,
+    errorDetails: error.details || null,
+    errorStack: error.stack || null,
+  });
+
+  await stateRef.set(
+    {
+      receivingSyncStatus: "pending",
+      receivingSyncError: error.message,
+      receivingSyncAttemptAt:
+        admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  return {
+    status: "sync_pending",
+    message: error.message,
+  };
+}
+
+    
+}
+
+/* =========================================================
    EXISTING SCRAPER — APPROVAL LOGIC PRESERVED
 ========================================================= */
 
-async function processMarketStage(market, stage, dateKey, currentTime) {
+async function processMarketStage(
+  market,
+  stage,
+  dateKey,
+  currentTime
+) {
   const stateId = `${dateKey}_${market.id}_${stage}`;
-  const stateRef = db.collection("marketScraperState").doc(stateId);
+
+  const stateRef = db
+    .collection("marketScraperState")
+    .doc(stateId);
 
   try {
     const snapshot = await stateRef.get();
-    const state = snapshot.exists ? snapshot.data() : {};
+
+    const state = snapshot.exists
+      ? snapshot.data()
+      : {};
 
     if (state.approved === true) {
+      // Never scrape an already-approved stage again.
+      // Retry receiving sync if it has not succeeded yet.
+      const syncResult = await trySyncApprovedStage(
+        market,
+        stage,
+        dateKey,
+        stateRef,
+        state
+      );
+
       return {
         market: market.name,
         stage,
-        status: "already_approved",
+        status: syncResult.status,
+        ...(syncResult.message
+          ? { message: syncResult.message }
+          : {}),
       };
     }
 
@@ -83,7 +494,9 @@ async function processMarketStage(market, stage, dateKey, currentTime) {
     }
 
     const scheduledTime =
-      stage === "open" ? market.openTime : market.closeTime;
+      stage === "open"
+        ? market.openTime
+        : market.closeTime;
 
     if (currentTime < scheduledTime) {
       return {
@@ -141,13 +554,40 @@ async function processMarketStage(market, stage, dateKey, currentTime) {
       };
     }
 
+    // Only accept a three-digit panna result.
+    if (!isValidPanna(confirmation.candidateResult)) {
+      await stateRef.set(
+        {
+          status: "invalid_result",
+          lastError:
+            `Invalid ${stage} panna: ${confirmation.candidateResult}`,
+          lastConfirmation: confirmation,
+        },
+        { merge: true }
+      );
+
+      logger.warn("Approved candidate has invalid panna format", {
+        market: market.name,
+        stage,
+        attempt,
+        candidateResult: confirmation.candidateResult,
+      });
+
+      return {
+        market: market.name,
+        stage,
+        attempt,
+        status: "invalid_result",
+      };
+    }
+
     /*
-     * Save the approved result in three places:
-     * 1. marketResults: latest result for each market.
-     * 2. marketScraperState: scraper approval state.
-     * 3. marketResultHistory: permanent date-wise result history.
+     * Save the approved result in three source-project documents:
+     * 1. marketResults — current result for each market.
+     * 2. marketScraperState — approval and retry state.
+     * 3. marketResultHistory — date-wise history.
      *
-     * All three writes are committed together.
+     * These three writes are committed together.
      */
 
     const batch = db.batch();
@@ -167,12 +607,13 @@ async function processMarketStage(market, stage, dateKey, currentTime) {
         [`${stage}ApprovedAt`]:
           admin.firestore.FieldValue.serverTimestamp(),
         [`${stage}DateKey`]: dateKey,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt:
+          admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
-    // 2. Existing scraper approval state.
+    // 2. Scraper approval state.
     batch.set(
       stateRef,
       {
@@ -185,14 +626,14 @@ async function processMarketStage(market, stage, dateKey, currentTime) {
         status: "approved",
         approvedResult: confirmation.candidateResult,
         matchingSources: confirmation.matchingSources,
-        approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        approvedAt:
+          admin.firestore.FieldValue.serverTimestamp(),
+        receivingSyncStatus: "pending",
       },
       { merge: true }
     );
 
-    // 3. Permanent date-wise result history.
-    // The deterministic ID prevents duplicate records for the same
-    // date, market, and stage.
+    // 3. Permanent date-wise history.
     const historyId = `${dateKey}_${market.id}_${stage}`;
 
     const historyRef = db
@@ -214,12 +655,13 @@ async function processMarketStage(market, stage, dateKey, currentTime) {
         matchingSources: confirmation.matchingSources,
         approved: true,
         status: "approved",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt:
+          admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
-    // Commit all three records together.
+    // Commit source-project approval before attempting the receiving sync.
     await batch.commit();
 
     logger.info("Market result approved and saved", {
@@ -230,11 +672,31 @@ async function processMarketStage(market, stage, dateKey, currentTime) {
       matchingSources: confirmation.matchingSources,
     });
 
+    const freshStateSnapshot = await stateRef.get();
+
+    const freshState = freshStateSnapshot.exists
+      ? freshStateSnapshot.data()
+      : {};
+
+    const syncResult = await trySyncApprovedStage(
+      market,
+      stage,
+      dateKey,
+      stateRef,
+      freshState
+    );
+
     return {
       market: market.name,
       stage,
-      status: "approved",
+      status:
+        syncResult.status === "synced"
+          ? "approved_and_synced"
+          : syncResult.status,
       result: confirmation.candidateResult,
+      ...(syncResult.message
+        ? { syncMessage: syncResult.message }
+        : {}),
     };
   } catch (error) {
     logger.error("Market stage failed", {
@@ -265,7 +727,6 @@ async function processMarketStage(market, stage, dateKey, currentTime) {
     };
   }
 }
-
 /* =========================================================
    SCHEDULED MARKET SCRAPER
 ========================================================= */

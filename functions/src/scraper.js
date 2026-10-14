@@ -438,39 +438,43 @@ function evaluateResult(result, market) {
 // GET NORMALIZED STAGE VALUE
 // ============================================
 
+
 function getStageValue(result, stage) {
   if (!result || result.isTodayResult !== true) {
     return null;
   }
 
   if (stage === "open") {
+    // Open approval must contain ONLY the 3-digit panna.
+    const panna = String(result.openPanel ?? "").trim();
+
     if (
       result.openComplete !== true ||
-      !result.openPanel ||
-      result.openJodi === null ||
-      result.openJodi === undefined
+      !/^\d{3}$/.test(panna)
     ) {
       return null;
     }
 
-    return `${result.openPanel}-${String(
-      result.openJodi
-    ).padStart(2, "0")}`;
+    return panna;
   }
 
   if (stage === "close") {
+    // Close approval must contain ONLY the 3-digit close panna.
+    const panna = String(result.closePanel ?? "").trim();
+
     if (
       result.closeComplete !== true ||
-      !result.closePanel
+      !/^\d{3}$/.test(panna)
     ) {
       return null;
     }
 
-    return result.closePanel;
+    return panna;
   }
 
   return null;
 }
+
 
 // ============================================
 // CONFIRM RESULT FROM AT LEAST TWO SOURCES
