@@ -3,6 +3,7 @@
 const { setGlobalOptions } = require("firebase-functions/v2");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 
@@ -34,7 +35,14 @@ const receivingDb = receivingApp.firestore();
 
 const TIME_ZONE = "Asia/Kolkata";
 const MAX_ATTEMPTS = 11;
+const TELEGRAM_BOT_TOKEN = defineSecret("TELEGRAM_BOT_TOKEN");
 
+// Add all your Telegram public channel usernames here.
+const TELEGRAM_CHANNELS = [
+  "@mresultupdates1",
+  // "@yoursecondchannel",
+  // "@yourthirdchannel",
+];
 setGlobalOptions({
   maxInstances: 1,
 });
@@ -483,6 +491,14 @@ async function processMarketStage(
       : {};
 
     if (state.approved === true) {
+      await tryPublishApprovedStageToTelegram(
+  market,
+  stage,
+  dateKey,
+  state.approvedResult,
+  stateRef,
+  state
+);
       // Never scrape an already-approved stage again.
       // Retry receiving sync if it has not succeeded yet.
       const syncResult = await trySyncApprovedStage(
@@ -708,7 +724,14 @@ async function processMarketStage(
     const freshState = freshStateSnapshot.exists
       ? freshStateSnapshot.data()
       : {};
-
+await tryPublishApprovedStageToTelegram(
+  market,
+  stage,
+  dateKey,
+  confirmation.candidateResult,
+  stateRef,
+  freshState
+);
     const syncResult = await trySyncApprovedStage(
       market,
       stage,
@@ -759,6 +782,131 @@ async function processMarketStage(
   }
 }
 
+async function publishApprovedStageToTelegram(
+  market,
+  stage,
+  dateKey,
+  result,
+  stateRef,
+  state
+) {
+  const token = TELEGRAM_BOT_TOKEN.value();
+
+  if (!token) {
+    throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
+  }
+
+  const sentChannels = new Set(
+    Array.isArray(state.telegramSentChannels)
+      ? state.telegramSentChannels
+      : []
+  );
+
+  for (const channel of TELEGRAM_CHANNELS) {
+    // Skip channels that already received this result.
+    if (sentChannels.has(channel)) continue;
+
+    const message = [
+      "📢 MARKET RESULT",
+      "",
+      `Market: ${market.name}`,
+      `Stage: ${String(stage).toUpperCase()}`,
+      `Result: ${result}`,
+      `Date: ${dateKey}`,
+    ].join("\n");
+
+    const response = await fetch(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: channel,
+          text: message,
+        }),
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || !data.ok) {
+      throw new Error(
+        `Telegram failed for ${channel}: ${
+          data.description || response.statusText
+        }`
+      );
+    }
+
+    // Record each successful channel immediately.
+    await stateRef.set(
+      {
+        telegramSentChannels: [
+          ...new Set([...sentChannels, channel]),
+        ],
+        telegramStatus: "pending",
+        telegramLastSentAt:
+          admin.firestore.FieldValue.serverTimestamp(),
+        telegramError: null,
+      },
+      { merge: true }
+    );
+
+    sentChannels.add(channel);
+  }
+
+  await stateRef.set(
+    {
+      telegramStatus: "sent",
+      telegramSentAt:
+        admin.firestore.FieldValue.serverTimestamp(),
+      telegramError: null,
+    },
+    { merge: true }
+  );
+}
+
+async function tryPublishApprovedStageToTelegram(
+  market,
+  stage,
+  dateKey,
+  result,
+  stateRef,
+  state
+) {
+  try {
+    await publishApprovedStageToTelegram(
+      market,
+      stage,
+      dateKey,
+      result,
+      stateRef,
+      state
+    );
+
+    return { status: "sent" };
+  } catch (error) {
+    logger.error("Telegram publishing failed; will retry", {
+      market: market.name,
+      stage,
+      dateKey,
+      message: error.message,
+    });
+
+    await stateRef.set(
+      {
+        telegramStatus: "pending",
+        telegramError: error.message,
+        telegramAttemptAt:
+          admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    ).catch(() => {});
+
+    return { status: "pending", message: error.message };
+  }
+}
+
+
 /* =========================================================
    SCHEDULED MARKET SCRAPER
 ========================================================= */
@@ -770,6 +918,7 @@ exports.scheduledMarketScraper = onSchedule(
     timeoutSeconds: 300,
     memory: "512MiB",
     maxInstances: 1,
+    secrets: [TELEGRAM_BOT_TOKEN],
   },
   async () => {
     const { dateKey, time } = getLocalDateAndTime();
